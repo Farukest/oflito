@@ -666,7 +666,7 @@ where
             .transpose()?;
 
         // Create a channel for new orders to be sent to the OrderPicker / from monitors
-        // let (new_order_tx, new_order_rx) = mpsc::channel(NEW_ORDER_CHANNEL_CAPACITY);
+        let (new_order_tx, new_order_rx) = mpsc::channel(NEW_ORDER_CHANNEL_CAPACITY);
 
         // Create a broadcast channel for order state change messages
         let (order_state_tx, _) = tokio::sync::broadcast::channel(ORDER_STATE_CHANNEL_CAPACITY);
@@ -725,29 +725,29 @@ where
         });
 
 
-        // // spin up a supervisor for the offchain market monitor
-        // if let Some(client_clone) = client {
-        //     let offchain_market_monitor =
-        //         Arc::new(offchain_market_monitor::OffchainMarketMonitor::new(
-        //             client_clone,
-        //             self.args.private_key.clone(),
-        //             new_order_tx.clone(),
-        //             self.args.private_key.address(),
-        //             self.provider.clone(),
-        //             self.db.clone(),
-        //             prover.clone(),
-        //             self.config_watcher.config.clone()
-        //         ));
-        //     let cloned_config = config.clone();
-        //     let cancel_token = non_critical_cancel_token.clone();
-        //     supervisor_tasks.spawn(async move {
-        //         Supervisor::new(offchain_market_monitor, cloned_config, cancel_token)
-        //             .spawn()
-        //             .await
-        //             .context("Failed to start offchain market monitor")?;
-        //         Ok(())
-        //     });
-        // }
+        // spin up a supervisor for the offchain market monitor
+        if let Some(client_clone) = client {
+            let offchain_market_monitor =
+                Arc::new(offchain_market_monitor::OffchainMarketMonitor::new(
+                    client_clone,
+                    self.args.private_key.clone(),
+                    new_order_tx.clone(),
+                    self.args.private_key.address(),
+                    self.provider.clone(),
+                    self.db.clone(),
+                    prover.clone(),
+                    self.config_watcher.config.clone()
+                ));
+            let cloned_config = config.clone();
+            let cancel_token = non_critical_cancel_token.clone();
+            supervisor_tasks.spawn(async move {
+                Supervisor::new(offchain_market_monitor, cloned_config, cancel_token)
+                    .spawn()
+                    .await
+                    .context("Failed to start offchain market monitor")?;
+                Ok(())
+            });
+        }
 
 
         // let (c, pricing_rx) = mpsc::channel(PRICING_CHANNEL_CAPACITY);
