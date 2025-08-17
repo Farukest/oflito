@@ -113,14 +113,18 @@ impl<P> OffchainMarketMonitor<P> where
         let mut stream = order_stream(socket);
 
         // Config değerlerini önceden oku (her spawn'da okumak yerine)
-        let (allowed_requestors_opt, max_capacity, lockin_priority_gas) = {
+        let (allowed_requestors_opt, max_capacity, lockin_priority_gas, min_allowed_lock_timeout_secs) = {
             let locked_conf = config.lock_all().context("Failed to read config").unwrap();
             (
                 locked_conf.market.allow_requestor_addresses.clone(),
                 Some(1u32), // Konfigürasyondan alınabilir
-                locked_conf.market.lockin_priority_gas
+                locked_conf.market.lockin_priority_gas,
+                locked_conf.market.min_lock_out_time,
+
             )
         };
+
+
 
         loop {
             tokio::select! {
@@ -138,6 +142,16 @@ impl<P> OffchainMarketMonitor<P> where
                                 tracing::debug!("🚫 Client not in allowed requestors, skipping request: 0x{:x}", request_id);
                                 continue; // Hızlıca skip et, spawn bile yapma
                             }
+                        }
+
+                        if (order_data.order.request.offer.lockTimeout as u64) < min_allowed_lock_timeout_secs { // Buradaki operatör ve dönüşüm doğru!
+                            tracing::info!(
+                                "Skipping order {}: Lock Timeout ({} seconds) is less than minimum required ({} seconds).",
+                                order_data.order.request.id,
+                                order_data.order.request.offer.lockTimeout, // Burayı değiştirmeden u32 olarak loglayabiliriz, sorun değil.
+                                min_allowed_lock_timeout_secs
+                            );
+                            continue;
                         }
 
                         // Her spawn için değişkenleri klonla
