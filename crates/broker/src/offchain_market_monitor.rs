@@ -352,7 +352,7 @@ impl<P> OffchainMarketMonitor<P> where
         }
 
         // Gas ayarları
-        let max_priority_fee_per_gas = 3_000_000_000u128;
+        let max_priority_fee_per_gas = lockin_priority_gas;
         let min_competitive_gas = 60_000_000u128;
         let base_fee = min_competitive_gas;
         let max_fee_per_gas = base_fee + max_priority_fee_per_gas;
