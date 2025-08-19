@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use alloy::network::Ethereum;
-use alloy::primitives::{Address, U256, Bytes};
+use alloy::primitives::{Address, U256, Bytes, TxHash, FixedBytes};
 use alloy::providers::Provider;
 use alloy::signers::{local::PrivateKeySigner, Signer};
 use boundless_market::order_stream_client::{order_stream, OrderStreamClient};
@@ -168,20 +168,21 @@ impl<P> OffchainMarketMonitor<P> where
                                 continue;
                             }
 
+                            // Fix 1: Convert U256 to u128
                             let request_id = order_data.order.request.id;
+                            let request_id_u128 = u128::try_from(request_id)
+                                .context("Request ID too large for u128")?;
                             let client_addr = order_data.order.request.client_address();
 
-
+                            tracing::info!("THIS IS THE ORDER ID LISTENED ::::::::::::: 0x{:x} : ", request_id_u128);
 
                             // İzin verilen adres kontrolü
                             if let Some(ref allow_addresses) = allowed_requestors_opt {
                                 if !allow_addresses.contains(&client_addr) {
-                                    // tracing::debug!("🚫 Client not in allowed requestors, skipping request: 0x{:x}", request_id);
+                                    tracing::debug!("🚫 Client not in allowed requestors, skipping request: 0x{:x}", request_id_u128);
                                     continue;
                                 }
                             }
-
-                            tracing::info!("THIS IS THE ORDER ID LISTENED ::::::::::::: 0x{:x} : ", request_id);
 
                             // Lock timeout kontrolü
                             if (order_data.order.request.offer.lockTimeout as u64) < min_allowed_lock_timeout_secs {
@@ -200,7 +201,7 @@ impl<P> OffchainMarketMonitor<P> where
                                     Ok(committed_orders) => {
                                         let committed_count = committed_orders.len();
                                         if committed_count as u32 >= max_capacity {
-                                            tracing::debug!("Max capacity reached ({}), skipping request: 0x{:x}", max_capacity, request_id);
+                                            tracing::debug!("Max capacity reached ({}), skipping request: 0x{:x}", max_capacity, request_id_u128);
                                             continue;
                                         }
                                     }
@@ -212,9 +213,8 @@ impl<P> OffchainMarketMonitor<P> where
                             }
 
                             is_processing = true;
-                            tracing::info!("🔄 Processing transaction for request: 0x{:x}", request_id);
+                            tracing::info!("🔄 Processing transaction for request: 0x{:x}", request_id_u128);
 
-                            // ✅ CRITICAL FIX: İşlem sonucunu düzgün handle et
                             match Self::send_private_transaction(
                                 &order_data,
                                 &signer,
@@ -225,7 +225,7 @@ impl<P> OffchainMarketMonitor<P> where
                                 provider.clone(),
                             ).await {
                                 Ok(lock_block) => {
-                                    tracing::info!("🔒 LOCK SUCCESS! Request: 0x{:x}, Block: {}", request_id, lock_block);
+                                    tracing::info!("🔒 LOCK SUCCESS! Request: 0x{:x}, Block: {}", request_id_u128, lock_block);
 
                                     // Block timestamp al
                                     let lock_timestamp = match provider
@@ -234,13 +234,13 @@ impl<P> OffchainMarketMonitor<P> where
                                     {
                                         Ok(Some(block)) => block.header.timestamp,
                                         Ok(None) => {
-                                            tracing::error!("Block {} not found", lock_block);
-                                            is_processing = false;
+                                            tracing::error!("🔥 CRITICAL: Block {} not found after successful lock!", lock_block);
+                                            is_processing = true;
                                             continue;
                                         }
                                         Err(e) => {
-                                            tracing::error!("Failed to get block {}: {:?}", lock_block, e);
-                                            is_processing = false;
+                                            tracing::error!("🔥 CRITICAL: Failed to get block {} after successful lock: {:?}", lock_block, e);
+                                            is_processing = true;
                                             continue;
                                         }
                                     };
@@ -249,8 +249,8 @@ impl<P> OffchainMarketMonitor<P> where
                                     let lock_price = match order_data.order.request.offer.price_at(lock_timestamp) {
                                         Ok(price) => price,
                                         Err(e) => {
-                                            tracing::error!("Failed to calculate lock price: {:?}", e);
-                                            is_processing = false;
+                                            tracing::error!("🔥 CRITICAL: Failed to calculate lock price after successful lock: {:?}", e);
+                                            is_processing = true;
                                             continue;
                                         }
                                     };
@@ -266,26 +266,30 @@ impl<P> OffchainMarketMonitor<P> where
 
                                     // DB'ye başarılı lock'ı kaydet
                                     if let Err(e) = db_obj.insert_accepted_request(&new_order, lock_price.clone()).await {
-                                        tracing::error!("FATAL: Failed to insert accepted request: {:?}", e);
+                                        tracing::error!("🔥 CRITICAL: Failed to insert accepted request after successful lock: {:?}", e);
+                                        is_processing = true;
+                                        continue;
                                     } else {
                                         tracing::info!("✅ Lock successful, order saved with price: {}", lock_price);
+                                        // ✅ Sadece tam başarılı olursa is_processing = false yap
+                                        is_processing = false;
                                     }
                                 }
                                 Err(err) => {
-                                    // ✅ CRITICAL: Transaction hatası - ama önce kontrol et ki gerçekten başarısız mı?
-                                    tracing::error!("❌ Transaction error for request: 0x{:x}, error: {}", request_id, err);
+                                    tracing::error!("❌ Transaction error for request: 0x{:x}, error: {}", request_id_u128, err);
 
-                                    // ✅ DOUBLE LOCKING PREVENTION: Chain'de lock var mı kontrol et
-                                    match Self::check_if_already_locked(&provider, client.boundless_market_address, U256::from(request_id)).await {
-                                        Ok(true) => {
-                                            tracing::warn!("⚠️ Transaction error occurred, but request 0x{:x} is already locked on-chain!", request_id);
+                                    // ✅ FIX 2: Önce bizim tx hash'imizi al ve kontrol et
+                                    match Self::check_our_transaction_and_lock_status(&provider, &signer, client.boundless_market_address, request_id_u128).await {
+                                        Ok((true, true)) => {
+                                            // Bizim transaction başarılı VE request locked
+                                            tracing::warn!("⚠️ Transaction error occurred, but OUR transaction was successful for 0x{:x}!", request_id_u128);
 
-                                            // Zaten locked ise, DB'ye kaydet (çünkü lock başarılı)
+                                            // Current block kullanarak DB'ye kaydet
                                             let current_block = match provider.get_block_number().await {
                                                 Ok(block_num) => block_num,
                                                 Err(e) => {
                                                     tracing::error!("Failed to get current block number: {:?}", e);
-                                                    is_processing = false;
+                                                    is_processing = true;
                                                     continue;
                                                 }
                                             };
@@ -297,12 +301,12 @@ impl<P> OffchainMarketMonitor<P> where
                                                 Ok(Some(block)) => block.header.timestamp,
                                                 Ok(None) => {
                                                     tracing::error!("Current block {} not found", current_block);
-                                                    is_processing = false;
+                                                    is_processing = true;
                                                     continue;
                                                 }
                                                 Err(e) => {
                                                     tracing::error!("Failed to get current block {}: {:?}", current_block, e);
-                                                    is_processing = false;
+                                                    is_processing = true;
                                                     continue;
                                                 }
                                             };
@@ -311,7 +315,7 @@ impl<P> OffchainMarketMonitor<P> where
                                                 Ok(price) => price,
                                                 Err(e) => {
                                                     tracing::error!("Failed to calculate lock price for recovered lock: {:?}", e);
-                                                    is_processing = false;
+                                                    is_processing = true;
                                                     continue;
                                                 }
                                             };
@@ -326,48 +330,67 @@ impl<P> OffchainMarketMonitor<P> where
 
                                             if let Err(e) = db_obj.insert_accepted_request(&new_order, lock_price).await {
                                                 tracing::error!("FATAL: Failed to insert accepted request after chain verification: {:?}", e);
+                                                is_processing = true;
                                             } else {
-                                                tracing::info!("✅ Request 0x{:x} found locked on-chain, saved to DB", request_id);
+                                                tracing::info!("✅ Our transaction was successful, request 0x{:x} saved to DB", request_id_u128);
                                             }
+                                            is_processing = false;
                                         }
-                                        Ok(false) => {
-                                            tracing::info!("✅ Request 0x{:x} confirmed NOT locked on-chain, adding to skipped", request_id);
+                                        Ok((false, true)) => {
+                                            // Bizim transaction başarısız AMA request locked (başkası yapmış)
+                                            tracing::info!("✅ Request 0x{:x} locked by someone else, not our transaction - skipping", request_id_u128);
 
-                                            // Gerçekten başarısız - skipped olarak kaydet
-                                            let new_order = OrderRequest::new(
-                                                order_data.order.request,
-                                                order_data.order.signature.as_bytes().into(),
-                                                FulfillmentType::LockAndFulfill,
-                                                client.boundless_market_address,
-                                                client.chain_id,
-                                            );
+                                            // let new_order = OrderRequest::new(
+                                            //     order_data.order.request,
+                                            //     order_data.order.signature.as_bytes().into(),
+                                            //     FulfillmentType::LockAndFulfill,
+                                            //     client.boundless_market_address,
+                                            //     client.chain_id,
+                                            // );
+                                            //
+                                            // if let Err(e) = db_obj.insert_skipped_request(&new_order).await {
+                                            //     tracing::error!("Failed to insert skipped request: {:?}", e);
+                                            // }
+                                            is_processing = false;
+                                        }
+                                        Ok((_, false)) => {
+                                            // Request locked değil - gerçekten başarısız
+                                            tracing::info!("✅ Request 0x{:x} confirmed NOT locked, adding to skipped", request_id_u128);
 
-                                            if let Err(e) = db_obj.insert_skipped_request(&new_order).await {
-                                                tracing::error!("Failed to insert skipped request: {:?}", e);
-                                            }
+                                            // let new_order = OrderRequest::new(
+                                            //     order_data.order.request,
+                                            //     order_data.order.signature.as_bytes().into(),
+                                            //     FulfillmentType::LockAndFulfill,
+                                            //     client.boundless_market_address,
+                                            //     client.chain_id,
+                                            // );
+                                            //
+                                            // if let Err(e) = db_obj.insert_skipped_request(&new_order).await {
+                                            //     tracing::error!("Failed to insert skipped request: {:?}", e);
+                                            // }
+                                            is_processing = false;
                                         }
                                         Err(check_err) => {
-                                            tracing::error!("Failed to check lock status for 0x{:x}: {:?}", request_id, check_err);
+                                            tracing::error!("Failed to check transaction and lock status for 0x{:x}: {:?}", request_id_u128, check_err);
 
-                                            // Chain kontrol edemediysek, güvenli tarafta kal - skipped olarak kaydet
-                                            let new_order = OrderRequest::new(
-                                                order_data.order.request,
-                                                order_data.order.signature.as_bytes().into(),
-                                                FulfillmentType::LockAndFulfill,
-                                                client.boundless_market_address,
-                                                client.chain_id,
-                                            );
-
-                                            if let Err(e) = db_obj.insert_skipped_request(&new_order).await {
-                                                tracing::error!("Failed to insert skipped request: {:?}", e);
-                                            }
+                                            // let new_order = OrderRequest::new(
+                                            //     order_data.order.request,
+                                            //     order_data.order.signature.as_bytes().into(),
+                                            //     FulfillmentType::LockAndFulfill,
+                                            //     client.boundless_market_address,
+                                            //     client.chain_id,
+                                            // );
+                                            //
+                                            // if let Err(e) = db_obj.insert_skipped_request(&new_order).await {
+                                            //     tracing::error!("Failed to insert skipped request: {:?}", e);
+                                            // }
+                                            is_processing = true;
                                         }
                                     }
                                 }
                             }
 
-                            is_processing = false;
-                            tracing::info!("✅ Transaction processing completed for request: 0x{:x}", request_id);
+                            tracing::info!("✅ Transaction processing completed for request: 0x{:x}", request_id_u128);
                         }
                         None => {
                             return Err(OffchainMarketMonitorErr::WebSocketErr(anyhow::anyhow!(
@@ -383,17 +406,16 @@ impl<P> OffchainMarketMonitor<P> where
         }
     }
 
-    // ✅ NEW: Chain'de request'in lock'lanıp lock'lanmadığını kontrol et
-    async fn check_if_already_locked(
-        provider: &Arc<P>,
-        contract_address: Address,
-        request_id: U256,
-    ) -> Result<bool, anyhow::Error> {
-        tracing::debug!("🔍 Checking if request 0x{:x} is already locked on-chain", request_id);
 
-        // ✅ Orijinal kodunuzdaki gibi requestIsLocked metodunu kullan
+    async fn check_our_transaction_and_lock_status(
+        provider: &Arc<P>,
+        signer: &PrivateKeySigner,
+        contract_address: Address,
+        request_id: u128,
+    ) -> Result<(bool, bool), anyhow::Error> {
+        // İlk önce request locked mı kontrol et
         let call = IBoundlessMarket::requestIsLockedCall {
-            requestId: request_id
+            requestId: U256::from(request_id)
         };
 
         let call_request = alloy::rpc::types::TransactionRequest::default()
@@ -403,12 +425,53 @@ impl<P> OffchainMarketMonitor<P> where
         let result = provider.call(call_request).await
             .context("Failed to call requestIsLocked")?;
 
-        // ABI decode the boolean result
         let is_locked = IBoundlessMarket::requestIsLockedCall::abi_decode_returns(&result)
             .context("Failed to decode requestIsLocked result")?;
 
         tracing::debug!("🔍 Request 0x{:x} lock status: {}", request_id, is_locked);
-        Ok(is_locked)
+
+        if !is_locked {
+            // Request locked değil - bizim transaction da başarısız demek
+            return Ok((false, false));
+        }
+
+        // Request locked - ama bizim transaction mı başkasının mı kontrol et
+        // Son birkaç bloktaki bizim adresimizden gelen transaction'ları kontrol et
+        let current_block = provider.get_block_number().await
+            .context("Failed to get current block number")?;
+
+        // Son 50 blok içinde bizim transaction'ımızı ara
+        let start_block = current_block.saturating_sub(50);
+
+        for block_num in start_block..=current_block {
+            if let Ok(Some(block)) = provider.get_block_by_number(block_num.into()).await {
+                for tx_hash in block.transactions.hashes() {
+                    // Fix 1: Convert &[u8; 32] to TxHash properly
+                    let tx_hash_fixed = TxHash::from_slice(tx_hash.as_slice());
+
+                    if let Ok(Some(tx)) = provider.get_transaction_by_hash(tx_hash_fixed).await {
+                        // Transaction receipt'i al - eski kodunuzdaki gibi
+                        if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash_fixed).await {
+                            // Eski kodunuzdaki gibi - receipt.from kullan
+                            let tx_from = receipt.from;
+                            let tx_to = tx.to();
+
+                            // Bizim adresimizden mi ve contract'a mı gönderilmiş
+                            if tx_from == signer.address() && tx_to == Some(contract_address) {
+                                // Transaction receipt kontrol et - zaten receipt var
+                                if receipt.status() {
+                                    tracing::debug!("🔍 Found our successful transaction: 0x{}", tx_hash_fixed);
+                                    return Ok((true, true));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Bizim başarılı transaction bulamadık ama request locked - başkası yapmış
+        Ok((false, true))
     }
 
     async fn send_private_transaction(
@@ -458,7 +521,6 @@ impl<P> OffchainMarketMonitor<P> where
         let tx_envelope: TxEnvelope = tx_signed.into();
         let tx_encoded = tx_envelope.encoded_2718();
 
-        // ✅ Transaction hash'i önceden hesapla (debugging için)
         let expected_tx_hash = tx_envelope.tx_hash();
         tracing::info!("🎯 Expected transaction hash: 0x{}", hex::encode(expected_tx_hash.as_slice()));
 
@@ -486,7 +548,6 @@ impl<P> OffchainMarketMonitor<P> where
         if let Some(error) = result.get("error") {
             let error_message = error.to_string().to_lowercase();
 
-            // Nonce hatası durumunda senkronize et
             if error_message.contains("nonce") {
                 tracing::error!("❌ Nonce hatası: {}", error);
 
@@ -502,7 +563,6 @@ impl<P> OffchainMarketMonitor<P> where
                 return Err(anyhow::anyhow!("Nonce error - resynchronized: {}", error));
             }
 
-            // Diğer hatalar için nonce geri al
             let prev_nonce = current_nonce;
             CURRENT_NONCE.store(prev_nonce, Ordering::Relaxed);
             tracing::warn!("⚠️ Transaction failed, rolled back nonce to: {}", prev_nonce);
@@ -519,14 +579,12 @@ impl<P> OffchainMarketMonitor<P> where
             .context("Failed to parse transaction hash")?;
         tracing::info!("🎯 Private transaction hash: {}", tx_hash);
 
-        // ✅ CRITICAL: Receipt bekleme sırasında hata olursa, transaction yine de başarılı olmuş olabilir
         let tx_receipt = Self::wait_for_transaction_receipt(provider.clone(), tx_hash_parsed)
             .await
             .context("Failed to get transaction receipt")?;
 
         if !tx_receipt.status() {
             tracing::warn!("⚠️ İşlem {} REVERT oldu. Lock alınamadı.", tx_hash);
-            // Transaction revert oldu - gerçekten başarısız
             return Err(anyhow::anyhow!("Transaction reverted on chain"));
         }
 
@@ -540,7 +598,7 @@ impl<P> OffchainMarketMonitor<P> where
 
     async fn wait_for_transaction_receipt(
         provider: Arc<P>,
-        tx_hash: alloy_primitives::TxHash,
+        tx_hash: TxHash,
     ) -> Result<alloy::rpc::types::TransactionReceipt, anyhow::Error> {
         tracing::info!("⏳ İşlem onayını bekliyor: 0x{}", hex::encode(tx_hash.as_slice()));
 
