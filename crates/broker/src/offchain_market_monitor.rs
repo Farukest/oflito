@@ -1,10 +1,6 @@
-// Copyright (c) 2025 RISC Zero, Inc.
-//
-// All rights reserved.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, U256, Bytes};
 use alloy::providers::Provider;
@@ -19,7 +15,7 @@ use boundless_market::{
         boundless_market::BoundlessMarketService, IBoundlessMarket,
     },
 };
-
+use alloy::consensus::Transaction;
 use crate::config::ConfigLock;
 use crate::order_monitor::OrderMonitorErr;
 use crate::provers::ProverObj;
@@ -150,7 +146,6 @@ impl<P> OffchainMarketMonitor<P> where
         let chain_id = 8453u64;
         CACHED_CHAIN_ID.store(chain_id, Ordering::Relaxed);
 
-        // ✅ Provider'ın built-in metodunu kullan - İLK NONCE
         let initial_nonce = provider
             .get_transaction_count(signer.address())
             .pending()
@@ -161,7 +156,6 @@ impl<P> OffchainMarketMonitor<P> where
 
         tracing::info!("✅ Cache initialized - ChainId: {}, Initial Nonce: {}", chain_id, initial_nonce);
 
-        // ✅ SERI İŞLEM İÇİN MUTEX/FLAG - PARALELLİKTEN KAÇINMAK İÇİN
         let mut is_processing = false;
 
         loop {
@@ -169,7 +163,6 @@ impl<P> OffchainMarketMonitor<P> where
                 order_data = stream.next() => {
                     match order_data {
                         Some(order_data) => {
-                            // ✅ PARALEL İŞLEM ENGELLEME - Bir transaction işleniyorsa yenisini bekle
                             if is_processing {
                                 tracing::warn!("⏳ Zaten bir transaction işleniyor, yeni order beklemede...");
                                 continue;
@@ -178,7 +171,6 @@ impl<P> OffchainMarketMonitor<P> where
                             let request_id = order_data.order.request.id;
                             let client_addr = order_data.order.request.client_address();
 
-                            // Hızlı filtreleme
                             tracing::info!("THIS IS THE ORDER ID LISTENED ::::::::::::: 0x{:x} : ", request_id);
 
                             // İzin verilen adres kontrolü
@@ -200,7 +192,7 @@ impl<P> OffchainMarketMonitor<P> where
                                 continue;
                             }
 
-                            // Kapasite kontrolü - PARALEL SPAWN KALDIRDIK, SERİ YAPIYORUZ
+                            // Kapasite kontrolü
                             if let Some(max_capacity) = max_capacity {
                                 match db_obj.get_committed_orders().await {
                                     Ok(committed_orders) => {
@@ -217,11 +209,10 @@ impl<P> OffchainMarketMonitor<P> where
                                 }
                             }
 
-                            // ✅ İŞLEM BAŞLATILIYOR - FLAG SET ET
                             is_processing = true;
                             tracing::info!("🔄 Processing transaction for request: 0x{:x}", request_id);
 
-                            // ✅ PARALEL SPAWN KALDIRDIK - SERİ OLARAK İŞLE
+                            // ✅ CRITICAL FIX: İşlem sonucunu düzgün handle et
                             match Self::send_private_transaction(
                                 &order_data,
                                 &signer,
@@ -271,7 +262,7 @@ impl<P> OffchainMarketMonitor<P> where
                                         client.chain_id,
                                     );
 
-                                    // ✅ DB'ye başarılı lock'ı kaydet
+                                    // DB'ye başarılı lock'ı kaydet
                                     if let Err(e) = db_obj.insert_accepted_request(&new_order, lock_price.clone()).await {
                                         tracing::error!("FATAL: Failed to insert accepted request: {:?}", e);
                                     } else {
@@ -279,24 +270,100 @@ impl<P> OffchainMarketMonitor<P> where
                                     }
                                 }
                                 Err(err) => {
-                                    tracing::error!("❌ Lock failed for request: 0x{:x}, error: {}", request_id, err);
+                                    // ✅ CRITICAL: Transaction hatası - ama önce kontrol et ki gerçekten başarısız mı?
+                                    tracing::error!("❌ Transaction error for request: 0x{:x}, error: {}", request_id, err);
 
-                                    // ✅ Failed lock'ı kaydet
-                                    let new_order = OrderRequest::new(
-                                        order_data.order.request,
-                                        order_data.order.signature.as_bytes().into(),
-                                        FulfillmentType::LockAndFulfill,
-                                        client.boundless_market_address,
-                                        client.chain_id,
-                                    );
+                                    // ✅ DOUBLE LOCKING PREVENTION: Chain'de lock var mı kontrol et
+                                    match Self::check_if_already_locked(&provider, client.boundless_market_address, U256::from(request_id)).await {
+                                        Ok(true) => {
+                                            tracing::warn!("⚠️ Transaction error occurred, but request 0x{:x} is already locked on-chain!", request_id);
 
-                                    if let Err(e) = db_obj.insert_skipped_request(&new_order).await {
-                                        tracing::error!("Failed to insert skipped request: {:?}", e);
+                                            // Zaten locked ise, DB'ye kaydet (çünkü lock başarılı)
+                                            let current_block = match provider.get_block_number().await {
+                                                Ok(block_num) => block_num,
+                                                Err(e) => {
+                                                    tracing::error!("Failed to get current block number: {:?}", e);
+                                                    is_processing = false;
+                                                    continue;
+                                                }
+                                            };
+
+                                            let lock_timestamp = match provider
+                                                .get_block_by_number(current_block.into())
+                                                .await
+                                            {
+                                                Ok(Some(block)) => block.header.timestamp,
+                                                Ok(None) => {
+                                                    tracing::error!("Current block {} not found", current_block);
+                                                    is_processing = false;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!("Failed to get current block {}: {:?}", current_block, e);
+                                                    is_processing = false;
+                                                    continue;
+                                                }
+                                            };
+
+                                            let lock_price = match order_data.order.request.offer.price_at(lock_timestamp) {
+                                                Ok(price) => price,
+                                                Err(e) => {
+                                                    tracing::error!("Failed to calculate lock price for recovered lock: {:?}", e);
+                                                    is_processing = false;
+                                                    continue;
+                                                }
+                                            };
+
+                                            let new_order = OrderRequest::new(
+                                                order_data.order.request,
+                                                order_data.order.signature.as_bytes().into(),
+                                                FulfillmentType::LockAndFulfill,
+                                                client.boundless_market_address,
+                                                client.chain_id,
+                                            );
+
+                                            if let Err(e) = db_obj.insert_accepted_request(&new_order, lock_price).await {
+                                                tracing::error!("FATAL: Failed to insert accepted request after chain verification: {:?}", e);
+                                            } else {
+                                                tracing::info!("✅ Request 0x{:x} found locked on-chain, saved to DB", request_id);
+                                            }
+                                        }
+                                        Ok(false) => {
+                                            tracing::info!("✅ Request 0x{:x} confirmed NOT locked on-chain, adding to skipped", request_id);
+
+                                            // Gerçekten başarısız - skipped olarak kaydet
+                                            let new_order = OrderRequest::new(
+                                                order_data.order.request,
+                                                order_data.order.signature.as_bytes().into(),
+                                                FulfillmentType::LockAndFulfill,
+                                                client.boundless_market_address,
+                                                client.chain_id,
+                                            );
+
+                                            if let Err(e) = db_obj.insert_skipped_request(&new_order).await {
+                                                tracing::error!("Failed to insert skipped request: {:?}", e);
+                                            }
+                                        }
+                                        Err(check_err) => {
+                                            tracing::error!("Failed to check lock status for 0x{:x}: {:?}", request_id, check_err);
+
+                                            // Chain kontrol edemediysek, güvenli tarafta kal - skipped olarak kaydet
+                                            let new_order = OrderRequest::new(
+                                                order_data.order.request,
+                                                order_data.order.signature.as_bytes().into(),
+                                                FulfillmentType::LockAndFulfill,
+                                                client.boundless_market_address,
+                                                client.chain_id,
+                                            );
+
+                                            if let Err(e) = db_obj.insert_skipped_request(&new_order).await {
+                                                tracing::error!("Failed to insert skipped request: {:?}", e);
+                                            }
+                                        }
                                     }
                                 }
                             }
 
-                            // ✅ İŞLEM BİTTİ - FLAG RESET ET
                             is_processing = false;
                             tracing::info!("✅ Transaction processing completed for request: 0x{:x}", request_id);
                         }
@@ -314,6 +381,34 @@ impl<P> OffchainMarketMonitor<P> where
         }
     }
 
+    // ✅ NEW: Chain'de request'in lock'lanıp lock'lanmadığını kontrol et
+    async fn check_if_already_locked(
+        provider: &Arc<P>,
+        contract_address: Address,
+        request_id: U256,
+    ) -> Result<bool, anyhow::Error> {
+        tracing::debug!("🔍 Checking if request 0x{:x} is already locked on-chain", request_id);
+
+        // ✅ Orijinal kodunuzdaki gibi requestIsLocked metodunu kullan
+        let call = IBoundlessMarket::requestIsLockedCall {
+            requestId: request_id
+        };
+
+        let call_request = alloy::rpc::types::TransactionRequest::default()
+            .to(contract_address)
+            .input(call.abi_encode().into());
+
+        let result = provider.call(call_request).await
+            .context("Failed to call requestIsLocked")?;
+
+        // ABI decode the boolean result
+        let is_locked = IBoundlessMarket::requestIsLockedCall::abi_decode_returns(&result)
+            .context("Failed to decode requestIsLocked result")?;
+
+        tracing::debug!("🔍 Request 0x{:x} lock status: {}", request_id, is_locked);
+        Ok(is_locked)
+    }
+
     async fn send_private_transaction(
         order_data: &boundless_market::order_stream_client::OrderData,
         signer: &PrivateKeySigner,
@@ -322,45 +417,30 @@ impl<P> OffchainMarketMonitor<P> where
         lockin_priority_gas: u64,
         prover_addr: Address,
         provider: Arc<P>,
-    ) -> Result<u64, anyhow::Error> {  // ✅ u64 (block number) return et
+    ) -> Result<u64, anyhow::Error> {
         tracing::info!("🚀 SENDING PRIVATE TRANSACTION...");
 
-        // Cache'den değerleri al
         let chain_id = CACHED_CHAIN_ID.load(Ordering::Relaxed);
-
-        // ✅ NONCE MANTIGI DEĞİŞTİRİLDİ - Node.js'teki gibi MEVCUT NONCE KULLAN
         let current_nonce = CURRENT_NONCE.load(Ordering::Relaxed);
-        tracing::info!("📦 Using nonce: {}", current_nonce);
+        CURRENT_NONCE.store(current_nonce + 1, Ordering::Relaxed);
+        tracing::info!("📦 Using nonce: {} (next will be: {})", current_nonce, current_nonce + 1);
 
-        // ✅ Doğru field name: clientSignature
         let lock_call = IBoundlessMarket::lockRequestCall {
             request: order_data.order.request.clone(),
             clientSignature: order_data.order.signature.as_bytes().into(),
         };
 
-        // ✅ ABI encode et
         let lock_calldata = lock_call.abi_encode();
-
-        // 🔍 CALLDATA'yı logla
         tracing::info!("🔍 ENCODED CALLDATA: 0x{}", hex::encode(&lock_calldata));
-        tracing::info!("📏 CALLDATA Length: {} bytes", lock_calldata.len());
 
-        // Method ID'yi ayrı logla (ilk 4 byte)
-        if lock_calldata.len() >= 4 {
-            tracing::info!("🎯 METHOD ID: 0x{}", hex::encode(&lock_calldata[0..4]));
-            tracing::info!("📦 PARAMETERS: 0x{}", hex::encode(&lock_calldata[4..]));
-        }
-
-        // Gas ayarları
         let max_priority_fee_per_gas = lockin_priority_gas.into();
         let min_competitive_gas = 60_000_000u128;
         let base_fee = min_competitive_gas;
         let max_fee_per_gas = base_fee + max_priority_fee_per_gas;
 
-        // Transaction oluştur
         let tx = TxEip1559 {
             chain_id,
-            nonce: current_nonce,  // ✅ Mevcut nonce kullan
+            nonce: current_nonce,
             gas_limit: 500_000u64,
             max_fee_per_gas,
             max_priority_fee_per_gas,
@@ -370,39 +450,44 @@ impl<P> OffchainMarketMonitor<P> where
             access_list: Default::default(),
         };
 
-        // Transaction'ı imzala
         let signature_hash = tx.signature_hash();
         let signature = signer.sign_hash(&signature_hash).await?;
         let tx_signed = tx.into_signed(signature);
         let tx_envelope: TxEnvelope = tx_signed.into();
         let tx_encoded = tx_envelope.encoded_2718();
 
-        // Private transaction gönder
+        // ✅ Transaction hash'i önceden hesapla (debugging için)
+        let expected_tx_hash = tx_envelope.tx_hash();
+        tracing::info!("🎯 Expected transaction hash: 0x{}", hex::encode(expected_tx_hash.as_slice()));
+
         let rclient = reqwest::Client::new();
         let response = rclient
             .post(http_rpc_url)
             .header("Content-Type", "application/json")
             .json(&json!({
-            "jsonrpc": "2.0",
-            "method": "eth_sendPrivateTransaction",
-            "params": [{
-                "tx": format!("0x{}", hex::encode(&tx_encoded)),
-                "maxBlockNumber": "0x0",
-                "source": "customer_farukest"
-            }],
-            "id": 1
-        }))
+                "jsonrpc": "2.0",
+                "method": "eth_sendPrivateTransaction",
+                "params": [{
+                    "tx": format!("0x{}", hex::encode(&tx_encoded)),
+                    "maxBlockNumber": "0x0",
+                    "source": "customer_farukest"
+                }],
+                "id": 1
+            }))
             .send()
-            .await?;
+            .await
+            .context("Failed to send private transaction request")?;
 
-        let result: serde_json::Value = response.json().await?;
+        let result: serde_json::Value = response.json().await
+            .context("Failed to parse response JSON")?;
 
         if let Some(error) = result.get("error") {
-            // ✅ NONCE HATA KONTROLÜ - Node.js'teki gibi
             let error_message = error.to_string().to_lowercase();
+
+            // Nonce hatası durumunda senkronize et
             if error_message.contains("nonce") {
                 tracing::error!("❌ Nonce hatası: {}", error);
-                // Nonce'u yeniden senkronize et
+
                 let fresh_nonce = provider
                     .get_transaction_count(signer.address())
                     .pending()
@@ -410,8 +495,16 @@ impl<P> OffchainMarketMonitor<P> where
                     .context("Failed to get fresh transaction count")?;
 
                 CURRENT_NONCE.store(fresh_nonce, Ordering::Relaxed);
-                tracing::info!("🔄 Nonce yeniden senkronize edildi: {}", fresh_nonce);
+                tracing::info!("🔄 Nonce resynchronized from {} to {}", current_nonce, fresh_nonce);
+
+                return Err(anyhow::anyhow!("Nonce error - resynchronized: {}", error));
             }
+
+            // Diğer hatalar için nonce geri al
+            let prev_nonce = current_nonce;
+            CURRENT_NONCE.store(prev_nonce, Ordering::Relaxed);
+            tracing::warn!("⚠️ Transaction failed, rolled back nonce to: {}", prev_nonce);
+
             return Err(anyhow::anyhow!("Private transaction failed: {}", error));
         }
 
@@ -420,35 +513,68 @@ impl<P> OffchainMarketMonitor<P> where
             .ok_or_else(|| anyhow::anyhow!("No transaction hash in response"))?
             .to_string();
 
-        tracing::info!("🔒 Private transaction sent: {}", tx_hash);
+        let tx_hash_parsed = tx_hash.parse()
+            .context("Failed to parse transaction hash")?;
+        tracing::info!("🎯 Private transaction hash: {}", tx_hash);
 
-        // ✅ Transaction'ı bekle ve block number al
-        let tx_hash_parsed = tx_hash.parse()?;
-        let tx_receipt = provider
-            .get_transaction_receipt(tx_hash_parsed)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Transaction receipt not found"))?;
+        // ✅ CRITICAL: Receipt bekleme sırasında hata olursa, transaction yine de başarılı olmuş olabilir
+        let tx_receipt = Self::wait_for_transaction_receipt(provider.clone(), tx_hash_parsed)
+            .await
+            .context("Failed to get transaction receipt")?;
 
         if !tx_receipt.status() {
-            // ✅ REVERT DURUMUNDA DA NONCE ARTTIR - Node.js'teki gibi
-            let next_nonce = CURRENT_NONCE.load(Ordering::Relaxed) + 1;
-            CURRENT_NONCE.store(next_nonce, Ordering::Relaxed);
-            tracing::warn!("⚠️ Transaction reverted but nonce consumed. Next nonce: {}", next_nonce);
-            return Err(anyhow::anyhow!("Transaction failed on chain"));
+            tracing::warn!("⚠️ İşlem {} REVERT oldu. Lock alınamadı.", tx_hash);
+            // Transaction revert oldu - gerçekten başarısız
+            return Err(anyhow::anyhow!("Transaction reverted on chain"));
         }
 
         let lock_block = tx_receipt.block_number
             .ok_or_else(|| anyhow::anyhow!("No block number in receipt"))?;
 
-        // ✅ BAŞARILI TRANSACTION SONRASI NONCE ARTTIR - Node.js'teki gibi
-        let next_nonce = CURRENT_NONCE.load(Ordering::Relaxed) + 1;
-        CURRENT_NONCE.store(next_nonce, Ordering::Relaxed);
-        tracing::info!("✅ LOCK SUCCESS at block: {}, Next nonce: {}", lock_block, next_nonce);
+        tracing::info!("✅ İşlem {} başarıyla onaylandı. Lock alındı. Block: {}", tx_hash, lock_block);
 
-        // ✅ Block number return et
         Ok(lock_block)
     }
 
+    async fn wait_for_transaction_receipt(
+        provider: Arc<P>,
+        tx_hash: alloy_primitives::TxHash,
+    ) -> Result<alloy::rpc::types::TransactionReceipt, anyhow::Error> {
+        tracing::info!("⏳ İşlem onayını bekliyor: 0x{}", hex::encode(tx_hash.as_slice()));
+
+        const RECEIPT_TIMEOUT: Duration = Duration::from_secs(60);
+        const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+        let start_time = Instant::now();
+
+        loop {
+            if start_time.elapsed() > RECEIPT_TIMEOUT {
+                return Err(anyhow::anyhow!(
+                    "Transaction 0x{} timeout after {} seconds",
+                    hex::encode(tx_hash.as_slice()),
+                    RECEIPT_TIMEOUT.as_secs()
+                ));
+            }
+
+            match provider.get_transaction_receipt(tx_hash).await {
+                Ok(Some(receipt)) => {
+                    let elapsed = start_time.elapsed();
+                    tracing::info!("✅ İşlem 0x{} başarıyla onaylandı ({:.1}s sonra)",
+                                 hex::encode(tx_hash.as_slice()), elapsed.as_secs_f64());
+                    return Ok(receipt);
+                }
+                Ok(None) => {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!("Error getting transaction receipt: {:?}, retrying...", e);
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+            }
+        }
+    }
 }
 
 impl<P> RetryTask for OffchainMarketMonitor<P>
