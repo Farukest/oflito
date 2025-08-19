@@ -443,7 +443,7 @@ impl<P> OffchainMarketMonitor<P> where
         prover_addr: Address,
         provider: Arc<P>,
     ) -> Result<u64, anyhow::Error> {
-        tracing::info!("🚀 SENDING PRIVATE TRANSACTION...");
+        // tracing::info!("🚀 SENDING PRIVATE TRANSACTION...");
 
         let chain_id = CACHED_CHAIN_ID.load(Ordering::Relaxed);
         let current_nonce = CURRENT_NONCE.load(Ordering::Relaxed);
