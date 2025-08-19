@@ -211,7 +211,7 @@ impl<P> OffchainMarketMonitor<P> where
                             }
 
                             is_processing = true;
-                            tracing::info!("🔄 Processing transaction for request: 0x{:x}", request_id);
+                            // tracing::info!("🔄 Processing transaction for request: 0x{:x}", request_id);
 
                             match Self::send_private_transaction(
                                 &order_data,
@@ -448,7 +448,7 @@ impl<P> OffchainMarketMonitor<P> where
         let chain_id = CACHED_CHAIN_ID.load(Ordering::Relaxed);
         let current_nonce = CURRENT_NONCE.load(Ordering::Relaxed);
         CURRENT_NONCE.store(current_nonce + 1, Ordering::Relaxed);
-        tracing::info!("📦 Using nonce: {} (next will be: {})", current_nonce, current_nonce + 1);
+        // tracing::info!("📦 Using nonce: {} (next will be: {})", current_nonce, current_nonce + 1);
 
         let lock_call = IBoundlessMarket::lockRequestCall {
             request: order_data.order.request.clone(),
@@ -456,7 +456,7 @@ impl<P> OffchainMarketMonitor<P> where
         };
 
         let lock_calldata = lock_call.abi_encode();
-        tracing::info!("🔍 ENCODED CALLDATA: 0x{}", hex::encode(&lock_calldata));
+        // tracing::info!("🔍 ENCODED CALLDATA: 0x{}", hex::encode(&lock_calldata));
 
         let max_priority_fee_per_gas = lockin_priority_gas.into();
         let min_competitive_gas = 60_000_000u128;
@@ -482,7 +482,7 @@ impl<P> OffchainMarketMonitor<P> where
         let tx_encoded = tx_envelope.encoded_2718();
 
         let expected_tx_hash = tx_envelope.tx_hash();
-        tracing::info!("🎯 Expected transaction hash: 0x{}", hex::encode(expected_tx_hash.as_slice()));
+        // tracing::info!("🎯 Expected transaction hash: 0x{}", hex::encode(expected_tx_hash.as_slice()));
 
         let rclient = reqwest::Client::new();
         let response = rclient
