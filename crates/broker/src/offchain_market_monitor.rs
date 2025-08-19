@@ -171,15 +171,17 @@ impl<P> OffchainMarketMonitor<P> where
                             let request_id = order_data.order.request.id;
                             let client_addr = order_data.order.request.client_address();
 
-                            tracing::info!("THIS IS THE ORDER ID LISTENED ::::::::::::: 0x{:x} : ", request_id);
+
 
                             // İzin verilen adres kontrolü
                             if let Some(ref allow_addresses) = allowed_requestors_opt {
                                 if !allow_addresses.contains(&client_addr) {
-                                    tracing::debug!("🚫 Client not in allowed requestors, skipping request: 0x{:x}", request_id);
+                                    // tracing::debug!("🚫 Client not in allowed requestors, skipping request: 0x{:x}", request_id);
                                     continue;
                                 }
                             }
+
+                            tracing::info!("THIS IS THE ORDER ID LISTENED ::::::::::::: 0x{:x} : ", request_id);
 
                             // Lock timeout kontrolü
                             if (order_data.order.request.offer.lockTimeout as u64) < min_allowed_lock_timeout_secs {
