@@ -290,12 +290,12 @@ impl<P> OffchainMarketMonitor<P> where
                                                 Ok(Some(block)) => block.header.timestamp,
                                                 Ok(None) => {
                                                     tracing::error!("🔥 CRITICAL: Lock block {} not found!", lock_block);
-                                                    is_processing = false;
+                                                    is_processing = true;
                                                     continue;
                                                 }
                                                 Err(e) => {
                                                     tracing::error!("🔥 CRITICAL: Failed to get lock block {}: {:?}", lock_block, e);
-                                                    is_processing = false;
+                                                    is_processing = true;
                                                     continue;
                                                 }
                                             };
@@ -304,7 +304,7 @@ impl<P> OffchainMarketMonitor<P> where
                                                 Ok(price) => price,
                                                 Err(e) => {
                                                     tracing::error!("🔥 CRITICAL: Failed to calculate lock price for block {}: {:?}", lock_block, e);
-                                                    is_processing = false;
+                                                    is_processing = true;
                                                     continue;
                                                 }
                                             };
@@ -319,7 +319,7 @@ impl<P> OffchainMarketMonitor<P> where
 
                                             if let Err(e) = db_obj.insert_accepted_request(&new_order, lock_price).await {
                                                 tracing::error!("🔥 CRITICAL: Failed to insert accepted request after chain verification: {:?}", e);
-                                                is_processing = false;
+                                                is_processing = true;
                                             } else {
                                                 tracing::info!("✅ Our transaction was successful, request 0x{:x} saved to DB with correct block {}", request_id, lock_block);
                                                 is_processing = false;
@@ -337,7 +337,7 @@ impl<P> OffchainMarketMonitor<P> where
                                         }
                                         Ok((true, true, None)) => {
                                             // Bizim transaction başarılı VE request locked + block numarası gelmedi
-                                            tracing::info!("✅ Request 0x{:x} confirmed NOT locked", request_id);
+                                            tracing::info!("✅ true, true, None : Request 0x{:x} confirmed NOT locked", request_id);
                                             is_processing = true;
                                         }
                                         Err(check_err) => {
