@@ -133,7 +133,7 @@ impl<P> OffchainMarketMonitor<P> where
                 locked_conf.market.allow_requestor_addresses.clone(),
                 Some(1u32),
                 locked_conf.market.lockin_priority_gas,
-                locked_conf.market.min_lock_out_time,
+                locked_conf.market.min_lock_out_time * 60,
             )
         };
 
