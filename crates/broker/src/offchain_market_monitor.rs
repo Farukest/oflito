@@ -170,16 +170,14 @@ impl<P> OffchainMarketMonitor<P> where
 
                             // Fix 1: Convert U256 to u128
                             let request_id = order_data.order.request.id;
-                            let request_id_u128 = u128::try_from(request_id)
-                                .context("Request ID too large for u128")?;
                             let client_addr = order_data.order.request.client_address();
 
-                            tracing::info!("THIS IS THE ORDER ID LISTENED ::::::::::::: 0x{:x} : ", request_id_u128);
+                            tracing::info!("THIS IS THE ORDER ID LISTENED ::::::::::::: 0x{:x} : ", request_id);
 
                             // İzin verilen adres kontrolü
                             if let Some(ref allow_addresses) = allowed_requestors_opt {
                                 if !allow_addresses.contains(&client_addr) {
-                                    tracing::debug!("🚫 Client not in allowed requestors, skipping request: 0x{:x}", request_id_u128);
+                                    tracing::debug!("🚫 Client not in allowed requestors, skipping request: 0x{:x}", request_id);
                                     continue;
                                 }
                             }
@@ -201,7 +199,7 @@ impl<P> OffchainMarketMonitor<P> where
                                     Ok(committed_orders) => {
                                         let committed_count = committed_orders.len();
                                         if committed_count as u32 >= max_capacity {
-                                            tracing::debug!("Max capacity reached ({}), skipping request: 0x{:x}", max_capacity, request_id_u128);
+                                            tracing::debug!("Max capacity reached ({}), skipping request: 0x{:x}", max_capacity, request_id);
                                             continue;
                                         }
                                     }
@@ -213,19 +211,19 @@ impl<P> OffchainMarketMonitor<P> where
                             }
 
                             is_processing = true;
-                            tracing::info!("🔄 Processing transaction for request: 0x{:x}", request_id_u128);
+                            tracing::info!("🔄 Processing transaction for request: 0x{:x}", request_id);
 
                             match Self::send_private_transaction(
                                 &order_data,
                                 &signer,
                                 client.boundless_market_address,
                                 http_rpc_url.clone(),
-                                lockin_priority_gas.unwrap_or(0),
+                                lockin_priority_gas.unwrap_or(5000000),
                                 prover_addr,
                                 provider.clone(),
                             ).await {
                                 Ok(lock_block) => {
-                                    tracing::info!("🔒 LOCK SUCCESS! Request: 0x{:x}, Block: {}", request_id_u128, lock_block);
+                                    tracing::info!("🔒 LOCK SUCCESS! Request: 0x{:x}, Block: {}", request_id, lock_block);
 
                                     // Block timestamp al
                                     let lock_timestamp = match provider
@@ -276,13 +274,13 @@ impl<P> OffchainMarketMonitor<P> where
                                     }
                                 }
                                 Err(err) => {
-                                    tracing::error!("❌ Transaction error for request: 0x{:x}, error: {}", request_id_u128, err);
+                                    tracing::error!("❌ Transaction error for request: 0x{:x}, error: {}", request_id, err);
 
                                     // ✅ FIX 2: Önce bizim tx hash'imizi al ve kontrol et
-                                    match Self::check_our_transaction_and_lock_status(&provider, &signer, client.boundless_market_address, request_id_u128).await {
+                                    match Self::check_our_transaction_and_lock_status(&provider, &signer, client.boundless_market_address, request_id).await {
                                         Ok((true, true)) => {
                                             // Bizim transaction başarılı VE request locked
-                                            tracing::warn!("⚠️ Transaction error occurred, but OUR transaction was successful for 0x{:x}!", request_id_u128);
+                                            tracing::warn!("⚠️ Transaction error occurred, but OUR transaction was successful for 0x{:x}!", request_id);
 
                                             // Current block kullanarak DB'ye kaydet
                                             let current_block = match provider.get_block_number().await {
@@ -332,13 +330,13 @@ impl<P> OffchainMarketMonitor<P> where
                                                 tracing::error!("FATAL: Failed to insert accepted request after chain verification: {:?}", e);
                                                 is_processing = true;
                                             } else {
-                                                tracing::info!("✅ Our transaction was successful, request 0x{:x} saved to DB", request_id_u128);
+                                                tracing::info!("✅ Our transaction was successful, request 0x{:x} saved to DB", request_id);
                                             }
                                             is_processing = false;
                                         }
                                         Ok((false, true)) => {
                                             // Bizim transaction başarısız AMA request locked (başkası yapmış)
-                                            tracing::info!("✅ Request 0x{:x} locked by someone else, not our transaction - skipping", request_id_u128);
+                                            tracing::info!("✅ Request 0x{:x} locked by someone else, not our transaction - skipping", request_id);
 
                                             // let new_order = OrderRequest::new(
                                             //     order_data.order.request,
@@ -355,7 +353,7 @@ impl<P> OffchainMarketMonitor<P> where
                                         }
                                         Ok((_, false)) => {
                                             // Request locked değil - gerçekten başarısız
-                                            tracing::info!("✅ Request 0x{:x} confirmed NOT locked, adding to skipped", request_id_u128);
+                                            tracing::info!("✅ Request 0x{:x} confirmed NOT locked, adding to skipped", request_id);
 
                                             // let new_order = OrderRequest::new(
                                             //     order_data.order.request,
@@ -371,7 +369,7 @@ impl<P> OffchainMarketMonitor<P> where
                                             is_processing = false;
                                         }
                                         Err(check_err) => {
-                                            tracing::error!("Failed to check transaction and lock status for 0x{:x}: {:?}", request_id_u128, check_err);
+                                            tracing::error!("Failed to check transaction and lock status for 0x{:x}: {:?}", request_id, check_err);
 
                                             // let new_order = OrderRequest::new(
                                             //     order_data.order.request,
@@ -390,7 +388,7 @@ impl<P> OffchainMarketMonitor<P> where
                                 }
                             }
 
-                            tracing::info!("✅ Transaction processing completed for request: 0x{:x}", request_id_u128);
+                            tracing::info!("✅ Transaction processing completed for request: 0x{:x}", request_id);
                         }
                         None => {
                             return Err(OffchainMarketMonitorErr::WebSocketErr(anyhow::anyhow!(
@@ -411,7 +409,7 @@ impl<P> OffchainMarketMonitor<P> where
         provider: &Arc<P>,
         signer: &PrivateKeySigner,
         contract_address: Address,
-        request_id: u128,
+        request_id: U256,
     ) -> Result<(bool, bool), anyhow::Error> {
         // İlk önce request locked mı kontrol et
         let call = IBoundlessMarket::requestIsLockedCall {
