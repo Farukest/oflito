@@ -25,7 +25,7 @@ min_lock_out_time = 150
 lock_delay_ms = 0
 prove_adress = "0x29f2b7e610abddb467885044c14a665263fd6aaaa78b0358489a33cd82a46584"
 block_number = 34291052
-my_rpc_url = "https://few-intensive-layer.base-mainnet.quiknode.pro/219e37029c041b5aa194aad4bc1dc42c307c54a7/"
+my_rpc_url = "https://proportionate-convincing-aura.base-mainnet.quiknode.pro/29b0cfcbc59ad7773398cbcd221e8dd21d18bf59/"
 allow_requestor_addresses = [
     "0x89f12aba0bcda3e708b1129eb2557b96f57b0de6",
 ]
